@@ -2,6 +2,8 @@
 # encoding: utf-8
 
 import random
+
+import cv2
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data import sampler
@@ -34,12 +36,24 @@ class lmdbDataset(Dataset):
 
         self.transform = transform
         self.target_transform = target_transform
+        self.mapping = [x for x in range(self.nSamples)]
 
     def __len__(self):
-        return self.nSamples
+        return len(self.mapping)
+
+    def subsample(self):
+        mapping = [x for x in range(self.nSamples)]
+        random.shuffle(mapping)
+        point = int(self.nSamples / 3)
+        for x in range(point):
+            mapping[x] = random.choice(mapping[point:])
+
+        self.mapping = mapping
 
     def __getitem__(self, index):
         assert index <= len(self), 'index range error'
+        # Get actual index
+        index = self.mapping[index]
         index += 1
         with self.env.begin(write=False) as txn:
             img_key = 'image-%09d' % index
@@ -49,7 +63,7 @@ class lmdbDataset(Dataset):
             buf.write(imgbuf)
             buf.seek(0)
             try:
-                img = Image.open(buf).convert('L')
+                img = Image.open(buf)
             except IOError:
                 print('Corrupted image for %d' % index)
                 return self[index + 1]
@@ -57,6 +71,8 @@ class lmdbDataset(Dataset):
             if self.transform is not None:
                 img = self.transform(img)
 
+            # cv2.imshow('', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            # cv2.waitKey(0)
             label_key = 'label-%09d' % index
             label = txn.get(label_key.encode('utf-8'))
 
@@ -74,7 +90,7 @@ class resizeNormalize(object):
         self.toTensor = transforms.ToTensor()
 
     def __call__(self, img):
-        img = img.resize(self.size, self.interpolation)
+        # img = img.resize(self.size, self.interpolation)
         img = self.toTensor(img)
         img.sub_(0.5).div_(0.5)
         return img

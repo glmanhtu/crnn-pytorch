@@ -27,10 +27,10 @@ class CRNN(nn.Module):
         super(CRNN, self).__init__()
         assert imgH % 16 == 0, 'imgH has to be a multiple of 16'
 
-        ks = [3, 3, 3, 3, 3, 3, 2]
-        ps = [1, 1, 1, 1, 1, 1, 0]
-        ss = [1, 1, 1, 1, 1, 1, 1]
-        nm = [64, 128, 256, 256, 512, 512, 512]
+        ks = [3, 3, 3, 3, 3, 3, 2, 2]
+        ps = [1, 1, 1, 1, 1, 1, 0, 0]
+        ss = [1, 1, 1, 1, 1, 1, 1, 1]
+        nm = [64, 128, 256, 256, 512, 512, 512, 512]
 
         cnn = nn.Sequential()
 
@@ -60,6 +60,7 @@ class CRNN(nn.Module):
         cnn.add_module('pooling{0}'.format(3),
                        nn.MaxPool2d((2, 2), (2, 1), (0, 1)))  # 512x2x16
         convRelu(6, True)  # 512x1x16
+        convRelu(7, True)  # 512x1x16
 
         self.cnn = cnn
         self.rnn = nn.Sequential(

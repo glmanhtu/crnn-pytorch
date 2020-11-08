@@ -2,11 +2,13 @@ from __future__ import print_function
 from __future__ import division
 
 import argparse
+import csv
 import random
 import torch
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
+import torchvision
 from torch.autograd import Variable
 import numpy as np
 # from warpctc_pytorch import CTCLoss
@@ -17,6 +19,10 @@ import dataset
 
 import models.crnn as net
 import params
+from augmentation import GridDistortion
+from error_rates import cer, jaccard_similarity
+from imgaug import augmenters as iaa
+import imgaug as ia
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-train', '--trainroot', required=True, help='path to train dataset')
@@ -33,6 +39,21 @@ torch.manual_seed(params.manualSeed)
 
 cudnn.benchmark = True
 
+
+class ImgAugTransform:
+    def __init__(self):
+        self.aug = iaa.Sequential([
+            iaa.Sometimes(0.35, iaa.GaussianBlur(sigma=(0, 1.5))),
+            iaa.Sometimes(0.35,
+                          iaa.OneOf([iaa.Dropout(p=(0, 0.05)),
+                                     iaa.CoarseDropout(0, size_percent=0.05)])),
+        ])
+
+    def __call__(self, img):
+        img = np.array(img)
+        return self.aug.augment_image(img)
+
+
 if torch.cuda.is_available() and not params.cuda:
     print("WARNING: You have a CUDA device, so you should probably set cuda in params.py to True")
 
@@ -43,7 +64,8 @@ In this block
 """
 def data_loader():
     # train
-    train_dataset = dataset.lmdbDataset(root=args.trainroot)
+    transform = torchvision.transforms.Compose([ImgAugTransform(), GridDistortion(prob=0.65)])
+    train_dataset = dataset.lmdbDataset(root=args.trainroot, transform=transform)
     assert train_dataset
     if not params.random_sample:
         sampler = dataset.randomSequentialSampler(train_dataset, params.batchSize)
@@ -54,7 +76,8 @@ def data_loader():
             collate_fn=dataset.alignCollate(imgH=params.imgH, imgW=params.imgW, keep_ratio=params.keep_ratio))
     
     # val
-    val_dataset = dataset.lmdbDataset(root=args.valroot, transform=dataset.resizeNormalize((params.imgW, params.imgH)))
+    transform = torchvision.transforms.Compose([dataset.resizeNormalize((params.imgW, params.imgH))])
+    val_dataset = dataset.lmdbDataset(root=args.valroot, transform=transform)
     assert val_dataset
     val_loader = torch.utils.data.DataLoader(val_dataset, shuffle=True, batch_size=params.batchSize, num_workers=int(params.workers))
     
@@ -85,7 +108,12 @@ def net_init():
         print('loading pretrained model from %s' % params.pretrained)
         if params.multi_gpu:
             crnn = torch.nn.DataParallel(crnn)
-        crnn.load_state_dict(torch.load(params.pretrained))
+        std = torch.load(params.pretrained)
+
+        # # Remove the last FC layer
+        std.popitem(last=True)
+        std.popitem(last=True)
+        crnn.load_state_dict(std, strict=False)
     
     return crnn
 
@@ -187,9 +215,13 @@ def val(net, criterion):
 
     i = 0
     n_correct = 0
+    similarity = 0
+    distances = 0
+    count = 0.0
     loss_avg = utils.averager() # The blobal loss_avg is used by train
 
     max_iter = len(val_loader)
+    all_predicts = []
     for i in range(max_iter):
         data = val_iter.next()
         i += 1
@@ -214,13 +246,22 @@ def val(net, criterion):
         for pred, target in zip(sim_preds, cpu_texts_decode):
             if pred == target:
                 n_correct += 1
+            simr = jaccard_similarity([x for x in pred], [x for x in target])
+            distance = cer(pred, target)
+            all_predicts.append({'pred': pred, 'actual': target, 'similarity': simr, 'distant': distance})
+            similarity += simr
+            distances += distance
+            count += 1
 
     raw_preds = converter.decode(preds.data, preds_size.data, raw=True)[:params.n_val_disp]
     for raw_pred, pred, gt in zip(raw_preds, sim_preds, cpu_texts_decode):
         print('%-20s => %-20s, gt: %-20s' % (raw_pred, pred, gt))
 
-    accuracy = n_correct / float(max_iter * params.batchSize)
-    print('Val loss: %f, accuray: %f' % (loss_avg.val(), accuracy))
+    accuracy = n_correct / count
+    similarity = similarity / count
+    distance = distances / count
+    print('Val loss: %f, accuracy: %f, similarity: %f, distance: %f' % (loss_avg.val(), accuracy, similarity, distance))
+    return accuracy, all_predicts
 
 
 def train(net, criterion, optimizer, train_iter):
@@ -247,6 +288,7 @@ def train(net, criterion, optimizer, train_iter):
 
 
 if __name__ == "__main__":
+    best_acc = 0
     for epoch in range(params.nepoch):
         train_iter = iter(train_loader)
         i = 0
@@ -261,8 +303,13 @@ if __name__ == "__main__":
                 loss_avg.reset()
 
             if i % params.valInterval == 0:
-                val(crnn, criterion)
+                acc, predicts = val(crnn, criterion)
+                if best_acc < acc:
+                    best_acc = acc
+                    torch.save(crnn.state_dict(), '{0}/finalCRNN.pth'.format(params.expr_dir))
+                    with open('results.csv', 'w') as f:
+                        writer = csv.DictWriter(f, fieldnames=predicts[0].keys())
+                        writer.writeheader()
+                        writer.writerows(predicts)
 
-            # do checkpointing
-            if i % params.saveInterval == 0:
-                torch.save(crnn.state_dict(), '{0}/netCRNN_{1}_{2}.pth'.format(params.expr_dir, epoch, i))
+    print('Final acc: ' + str(best_acc))
